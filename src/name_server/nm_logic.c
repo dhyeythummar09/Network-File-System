@@ -514,7 +514,14 @@ void nm_handle_create_file(int client_sock) {
     pthread_mutex_lock(&file_system_mutex);
     if (num_servers == 0) { pthread_mutex_unlock(&file_system_mutex); send_response(client_sock, MSG_ERROR, "No Storage Servers available."); return; }
     if (find_file_unsafe(payload.filename) != -1) { pthread_mutex_unlock(&file_system_mutex); send_response(client_sock, MSG_ERROR, "File already exists."); return; }
-    int target_ss_index = 0; SSRegisterPayload target_ss = active_servers[target_ss_index];
+    int target_ss_index = -1;
+    static int next_ss_file = 0;
+    for (int i = 0; i < num_servers; i++) {
+        int idx = (next_ss_file + i) % num_servers;
+        if (server_alive[idx]) { target_ss_index = idx; next_ss_file = (idx + 1) % num_servers; break; }
+    }
+    if (target_ss_index == -1) { pthread_mutex_unlock(&file_system_mutex); send_response(client_sock, MSG_ERROR, "No alive Storage Servers."); return; }
+    SSRegisterPayload target_ss = active_servers[target_ss_index];
     pthread_mutex_unlock(&file_system_mutex);
 
     int ss_sock = tcp_connect(target_ss.ip_addr, target_ss.client_port);
@@ -624,16 +631,30 @@ void nm_handle_create_folder(int client_sock) {
     FolderRequestPayload p; memset(&p,0,sizeof(p)); if (read_all(client_sock,&p,sizeof(p))==-1) return;
     pthread_mutex_lock(&file_system_mutex);
     if (num_servers == 0) { pthread_mutex_unlock(&file_system_mutex); send_response(client_sock, MSG_ERROR, "No Storage Servers available."); return; }
-    SSRegisterPayload target_ss = active_servers[0];
+    // Broadcast folder creation to all alive storage servers
+    int success_count = 0;
+    for (int si = 0; si < num_servers; si++) {
+        if (!server_alive[si]) continue;
+        SSRegisterPayload tss = active_servers[si];
+        int ss_sock = tcp_connect(tss.ip_addr, tss.client_port);
+        if (ss_sock == -1) continue;
+        PacketHeader h = {.type=MSG_SS_CREATE_FOLDER, .size=sizeof(p)};
+        write_all(ss_sock, &h, sizeof(h)); write_all(ss_sock, &p, sizeof(p));
+        PacketHeader rh; ResponsePayload rp;
+        if (read_all(ss_sock, &rh, sizeof(rh)) != -1 && read_all(ss_sock, &rp, rh.size) != -1) {
+            if (rh.type == MSG_SUCCESS) success_count++;
+        }
+        close(ss_sock);
+    }
+    if (success_count > 0) { add_user_folder(p.folder); }
     pthread_mutex_unlock(&file_system_mutex);
-    int ss_sock = tcp_connect(target_ss.ip_addr, target_ss.client_port);
-    if (ss_sock==-1) { send_response(client_sock, MSG_ERROR, "Failed to contact Storage Server."); return; }
-    PacketHeader h={.type=MSG_SS_CREATE_FOLDER,.size=sizeof(p)}; write_all(ss_sock,&h,sizeof(h)); write_all(ss_sock,&p,sizeof(p));
-    PacketHeader rh; ResponsePayload rp; if (read_all(ss_sock,&rh,sizeof(rh))==-1 || read_all(ss_sock,&rp,rh.size)==-1) { close(ss_sock); send_response(client_sock, MSG_ERROR, "No response from Storage Server."); return; }
-    close(ss_sock);
-    if (rh.type==MSG_SUCCESS) { add_user_folder(p.folder); }
-    send_response(client_sock, rh.type, rp.message);
-    nm_log_request(client_sock, p.username, "CREATEFOLDER '%s' -> %s", p.folder, rh.type==MSG_SUCCESS?"ok":"err");
+    if (success_count > 0) {
+        send_response(client_sock, MSG_SUCCESS, "Folder created.");
+        nm_log_request(client_sock, p.username, "CREATEFOLDER '%s' -> ok", p.folder);
+    } else {
+        send_response(client_sock, MSG_ERROR, "Failed to create folder on any server.");
+        nm_log_request(client_sock, p.username, "CREATEFOLDER '%s' -> err", p.folder);
+    }
 }
 
 void nm_handle_move_file(int client_sock) {
@@ -675,20 +696,41 @@ void nm_handle_view_folder(int client_sock) {
     ViewFolderPayload p; memset(&p,0,sizeof(p)); if (read_all(client_sock,&p,sizeof(p))==-1) return;
     pthread_mutex_lock(&file_system_mutex);
     if (num_servers == 0) { pthread_mutex_unlock(&file_system_mutex); send_response(client_sock, MSG_ERROR, "No Storage Servers available."); return; }
-    SSRegisterPayload target_ss = active_servers[0]; // Folder listing not tied to specific SS in this simple setup
-    pthread_mutex_unlock(&file_system_mutex);
-    int ss_sock = tcp_connect(target_ss.ip_addr, target_ss.client_port);
-    if (ss_sock==-1) { send_response(client_sock, MSG_ERROR, "Failed to contact Storage Server."); return; }
-    PacketHeader h={.type=MSG_SS_VIEW_FOLDER,.size=sizeof(p)}; write_all(ss_sock,&h,sizeof(h)); write_all(ss_sock,&p,sizeof(p));
-    PacketHeader rh; ResponsePayload rp; if (read_all(ss_sock,&rh,sizeof(rh))==-1 || read_all(ss_sock,&rp,rh.size)==-1) { close(ss_sock); send_response(client_sock, MSG_ERROR, "No response from Storage Server."); return; }
-    close(ss_sock);
-    if (rh.type != MSG_SUCCESS) { send_response(client_sock, rh.type, rp.message); return; }
-    // rp.message is newline-separated full paths in that folder; includes directories with trailing '/'
+    // Query all alive storage servers and aggregate folder listings
+    char merged[MAX_MSG_LEN]; merged[0]='\0';
+    for (int si = 0; si < num_servers; si++) {
+        if (!server_alive[si]) continue;
+        SSRegisterPayload tss = active_servers[si];
+        int ss_sock = tcp_connect(tss.ip_addr, tss.client_port);
+        if (ss_sock == -1) continue;
+        PacketHeader h = {.type=MSG_SS_VIEW_FOLDER, .size=sizeof(p)};
+        write_all(ss_sock, &h, sizeof(h)); write_all(ss_sock, &p, sizeof(p));
+        PacketHeader rh; ResponsePayload rp;
+        if (read_all(ss_sock, &rh, sizeof(rh)) != -1 && read_all(ss_sock, &rp, rh.size) != -1) {
+            if (rh.type == MSG_SUCCESS && rp.message[0] != '\0') {
+                if (merged[0] != '\0' && merged[strlen(merged)-1] != '\n')
+                    strncat(merged, "\n", sizeof(merged)-strlen(merged)-1);
+                strncat(merged, rp.message, sizeof(merged)-strlen(merged)-1);
+            }
+        }
+        close(ss_sock);
+    }
+    if (merged[0] == '\0') {
+        pthread_mutex_unlock(&file_system_mutex);
+        send_response(client_sock, MSG_SUCCESS, "(empty)\n");
+        return;
+    }
+    // Deduplicate and apply permission checks
     char out[MAX_MSG_LEN]; out[0]='\0';
-    pthread_mutex_lock(&file_system_mutex);
-    char buf[MAX_MSG_LEN]; strncpy(buf, rp.message, sizeof(buf)); buf[sizeof(buf)-1]='\0';
+    char seen[256][MAX_PATH_LEN]; int seen_n = 0;
+    char buf[MAX_MSG_LEN]; strncpy(buf, merged, sizeof(buf)); buf[sizeof(buf)-1]='\0';
     char* saveptr=NULL; char* line=strtok_r(buf, "\n", &saveptr);
     while (line) {
+        // Skip duplicates from multiple servers
+        int dup = 0;
+        for (int d = 0; d < seen_n; d++) { if (strcmp(seen[d], line)==0) { dup=1; break; } }
+        if (dup) { line = strtok_r(NULL, "\n", &saveptr); continue; }
+        if (seen_n < 256) strncpy(seen[seen_n++], line, MAX_PATH_LEN);
         size_t len = strlen(line);
         int is_dir = (len>0 && line[len-1]=='/');
         int idx = find_file_unsafe(line);
@@ -744,22 +786,23 @@ void nm_handle_delete_folder(int client_sock) {
         }
     }
     if (count==0) {
-        // No indexed files under this folder (either empty or all files owned by others but not indexed with ownership).
-        // Allow deletion of an existing empty folder: forward best-effort to a storage server.
+        // No indexed files under this folder: broadcast delete to all alive servers
         if (num_servers > 0) {
-            SSRegisterPayload target_ss = active_servers[0];
-            pthread_mutex_unlock(&file_system_mutex);
-            int ss_sock = tcp_connect(target_ss.ip_addr, target_ss.client_port);
-            if (ss_sock != -1) {
-                PacketHeader h = { .type = MSG_SS_DELETE_FOLDER, .size = sizeof(p) };
-                write_all(ss_sock, &h, sizeof(h));
-                write_all(ss_sock, &p, sizeof(p));
-                PacketHeader rh; ResponsePayload rp;
-                if (read_all(ss_sock, &rh, sizeof(rh)) != -1 && read_all(ss_sock, &rp, rh.size) != -1) {
-                    // Ignore response content; treat success if SS responded with MSG_SUCCESS.
+            for (int si = 0; si < num_servers; si++) {
+                if (!server_alive[si]) continue;
+                SSRegisterPayload tss = active_servers[si];
+                int ss_sock = tcp_connect(tss.ip_addr, tss.client_port);
+                if (ss_sock != -1) {
+                    PacketHeader h = { .type = MSG_SS_DELETE_FOLDER, .size = sizeof(p) };
+                    write_all(ss_sock, &h, sizeof(h));
+                    write_all(ss_sock, &p, sizeof(p));
+                    PacketHeader rh; ResponsePayload rp;
+                    if (read_all(ss_sock, &rh, sizeof(rh)) != -1 && read_all(ss_sock, &rp, rh.size) != -1) {}
+                    close(ss_sock);
                 }
-                close(ss_sock);
             }
+            remove_user_folder_recursive(folder);
+            pthread_mutex_unlock(&file_system_mutex);
             send_response(client_sock, MSG_SUCCESS, "Folder deleted.");
         } else {
             pthread_mutex_unlock(&file_system_mutex);
@@ -790,28 +833,25 @@ void nm_handle_delete_folder(int client_sock) {
             num_files--; hash_rebuild();
         }
     }
-    // If all files removed, persist and ask SS to delete empty dirs
+    // If all files removed, persist and broadcast folder delete to all alive servers
     if (ok) {
         save_file_index();
-        // Ask a server to remove the directory tree (best-effort)
         if (num_servers>0) {
-            SSRegisterPayload target_ss = active_servers[0];
-            pthread_mutex_unlock(&file_system_mutex);
-            int ss_sock = tcp_connect(target_ss.ip_addr, target_ss.client_port);
-            if (ss_sock!=-1) {
-                PacketHeader h={.type=MSG_SS_DELETE_FOLDER,.size=sizeof(p)}; write_all(ss_sock,&h,sizeof(h)); write_all(ss_sock,&p,sizeof(p));
-                PacketHeader rh; ResponsePayload rp; if (read_all(ss_sock,&rh,sizeof(rh))!=-1 && read_all(ss_sock,&rp,rh.size)!=-1) {
-                    // ignore content
+            for (int si = 0; si < num_servers; si++) {
+                if (!server_alive[si]) continue;
+                SSRegisterPayload tss = active_servers[si];
+                int ss_sock = tcp_connect(tss.ip_addr, tss.client_port);
+                if (ss_sock != -1) {
+                    PacketHeader h={.type=MSG_SS_DELETE_FOLDER,.size=sizeof(p)};
+                    write_all(ss_sock, &h, sizeof(h)); write_all(ss_sock, &p, sizeof(p));
+                    PacketHeader rh; ResponsePayload rp;
+                    if (read_all(ss_sock, &rh, sizeof(rh)) != -1 && read_all(ss_sock, &rp, rh.size) != -1) {}
+                    close(ss_sock);
                 }
-                close(ss_sock);
             }
-            // Update folder registry
-            pthread_mutex_lock(&file_system_mutex);
             remove_user_folder_recursive(folder);
-            pthread_mutex_unlock(&file_system_mutex);
-        } else {
-            pthread_mutex_unlock(&file_system_mutex);
         }
+        pthread_mutex_unlock(&file_system_mutex);
         send_response(client_sock, MSG_SUCCESS, "Folder deleted.");
     } else {
         pthread_mutex_unlock(&file_system_mutex);
